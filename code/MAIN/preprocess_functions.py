@@ -1,29 +1,22 @@
 import networkx as nx
-import astropy.stats
 import pandas as pd
 import numpy as np
 from scipy.spatial.distance import pdist, squareform
 import itertools
-import pydeseq2
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.default_inference import DefaultInference
-from pydeseq2.ds import DeseqStats
 from palettable import wesanderson
-import sys
-sys.inset.path(0 , './../MAIN/')
 from network_functions import abs_bicorr, pearson_corr
 import warnings
 
 warnings.filterwarnings('ignore')
 
-def DESEQ(expr , meta , condition, fit_type='parametric') : 
+def DESEQ(expr, fit_type='parametric') : 
     """
     Conducts differential expression analysis using DESeq2 algorithm.
 
     Parameters:
         count_mtx (pandas.DataFrame): Count data for different genes.
-        datMeta (pandas.DataFrame): Metadata for the samples in count_mtx.
-        condition (str): Column in datMeta to use for condition separation.
         fit_type (str, optional): Statistical fitting type for VST transformation.
 
     Returns:
@@ -34,21 +27,21 @@ def DESEQ(expr , meta , condition, fit_type='parametric') :
         
     dds = DeseqDataSet(
         counts=expr,
-        metadata=meta,
-        design_factors=condition,
+        metadata=pd.DataFrame(index=expr.index), # metadata: empty DataFrame with index matching the sample name
+        design_factors=[],
         refit_cooks=True,
         inference=inference,
         # n_cpus=8, # n_cpus can be specified here or in the inference object
-        )
+        ) # Intercept-only model (no condition)
     
     dds.deseq2()
 
-    DeseqDataSet.vst(dds_full , fit_type = fit_type)
-    vsd = dds_full.layers["vst_counts"]
+    DeseqDataSet.vst(dds , fit_type = fit_type) # Compute VST; blind=True ignores any design and is suitable for unsupervised tasks
+    vsd = dds.layers["vst_counts"]
     
     return vsd
 
-def data_preprocess(expr , meta , transcriptomics = False) :
+def data_preprocess(expr , meta , filter_gene_expr = False, log_transform=False) :
     """
     Processes count matrix data by removing genes with zero expression across all samples.
     Optionally filters genes based on expression levels and calculates similarity matrices.
@@ -65,8 +58,8 @@ def data_preprocess(expr , meta , transcriptomics = False) :
     n_genes = expr.shape[1]
     expr = expr.loc[: , (expr != 0).any(axis=0)] # remove any genes with all 0 expression
     
-    if gene_exp == True : 
-        filtered_genes = filter_genes(expr.T.to_numpy(), design=None, group=datMeta, lib_size=None, min_count=10, min_total_count=15, large_n=10, min_prop=0.7)
+    if filter_gene_expr == True : 
+        filtered_genes = filter_genes(expr.T.to_numpy(), design=None, group=meta, lib_size=None, min_count=10, min_total_count=15, large_n=10, min_prop=0.7)
 
         # Example printing the filtered rows
         print("Keeping %i genes" % sum(filtered_genes))
@@ -76,6 +69,9 @@ def data_preprocess(expr , meta , transcriptomics = False) :
 
         adjacency_matrix  = abs_bicorr(expr.T , mat_means=False)
     else : 
+        if log_transform : 
+            num = expr.select_dtypes(include='number')
+            expr[num.columns] = np.log(num)  
         adjacency_matrix  = pearson_corr(expr.T , mat_means=False)
 
     ku = adjacency_matrix.sum(axis= 1)
