@@ -35,11 +35,6 @@ from sklearn.metrics import (
     jaccard_score, classification_report, roc_auc_score
 )
 
-
-import sys
-sys.path.insert(0 , '.')
-import layer_conductance
-
 __all__ = [
     "compute_loss",
     "compute_auc",

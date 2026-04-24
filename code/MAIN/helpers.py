@@ -9,7 +9,12 @@ Functions exported
 - indices_of_subset
 - load_graph
 - node_labels
+- get_split_indices_from_masks
+- extract_node_embeddings_fullgraph
+- save_gnn_embeddings_pickle
+- save_pytorch_model
 """
+import os
 import warnings
 import pickle
 import pandas as pd
@@ -30,8 +35,220 @@ __all__ = [
     "merge_dfs",
     "indices_of_subset",
     "load_graph",
-    "node_labels"
+    "node_labels",
+    "load_pytorch_model",
+    "get_split_indices_from_masks",
+    "extract_node_embeddings_fullgraph",
+    "save_gnn_embeddings_pickle",
+    "save_pytorch_model"
 ]
+
+def save_pytorch_model(
+    model,
+    path: str,
+    optimizer=None,
+    extra: dict | None = None,
+    save_entire_model: bool = False,
+):
+    """
+    Save a PyTorch model alongside the embeddings file as a .pth file.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Trained PyTorch model.
+    path : str
+        Path to save the .pth file.
+    optimizer : torch.optim.Optimizer | None
+        Optional optimizer to save state from.
+    extra : dict | None
+        Optional metadata/config to include.
+    save_entire_model : bool
+        If True, saves the full model object.
+        If False, saves only state_dict (recommended).
+
+    Returns
+    -------
+    model_path : str
+        Path to the saved .pth file.
+    """
+    base, _ = os.path.splitext(path)
+    model_path = base + ".pth"
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
+    if save_entire_model:
+        payload = {
+            "model": model,
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+            "extra": extra,
+        }
+    else:
+        payload = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+            "extra": extra,
+        }
+
+    torch.save(payload, model_path)
+    return model_path
+
+def save_gnn_embeddings_pickle(
+    out_path: str,
+    H: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    y: np.ndarray | None = None,
+    extra: dict | None = None,
+):
+    """
+    Save embeddings + split indices (and optionally labels/extra metadata) to a pickle file.
+
+    Parameters
+    ----------
+    out_path : str
+        Where to write the .pkl file.
+    H : np.ndarray
+        Node embeddings, shape [N, d]
+    train_idx, val_idx, test_idx : np.ndarray
+        Index arrays into H (and y if provided)
+    y : np.ndarray | None
+        Optional multi-label targets aligned with H, shape [N, C]
+    extra : dict | None
+        Any additional metadata you want to store (config, model name, etc.)
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    payload = {
+        "embeddings": H.astype(np.float32, copy=False),
+        "train_idx": train_idx.astype(np.int64, copy=False),
+        "val_idx": val_idx.astype(np.int64, copy=False),
+        "test_idx": test_idx.astype(np.int64, copy=False),
+    }
+    if y is not None:
+        payload["y"] = y  # could cast to float32 if you want
+    if extra is not None:
+        payload["extra"] = extra
+
+    with open(out_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return out_path
+
+def get_split_indices_from_masks(data):
+    """
+    Returns train/val/test indices (numpy arrays) from boolean masks on a PyG Data object.
+    """
+    train_idx = data.train_mask.nonzero(as_tuple=False).view(-1).cpu().numpy()
+    val_idx   = data.val_mask.nonzero(as_tuple=False).view(-1).cpu().numpy()
+    test_idx  = data.test_mask.nonzero(as_tuple=False).view(-1).cpu().numpy()
+    return train_idx, val_idx, test_idx
+
+
+@torch.no_grad()
+def extract_node_embeddings_fullgraph(
+    model,
+    data,
+    device=None,
+    return_logits=False,
+    use_encoder_attr=True,
+):
+    """
+    Extracts embeddings for *all nodes* in `data` in one forward pass (full-batch).
+
+    Assumes your model forward returns: (embeddings, logits)
+      h, logits = model(x, edge_index)
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Trained PyG model (e.g., GraphSageSimple)
+    data : torch_geometric.data.Data
+        Must contain x and edge_index
+    device : str or torch.device
+        If None, inferred from model parameters.
+    return_logits : bool
+        If True, also return logits.
+    use_encoder_attr : bool
+        If True and model has `.encoder`, returns model.encoder(x, edge_index) as embeddings.
+        Otherwise uses the first output of model(x, edge_index).
+
+    Returns
+    -------
+    H : np.ndarray, shape [N, emb_dim]
+        Node embeddings
+    (optional) Z : np.ndarray, shape [N, num_labels]
+        Node logits
+    """
+    model.eval()
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    x = data.x.to(device)
+    edge_index = data.edge_index.to(device)
+
+    h, logits = model(x, edge_index)
+    H = h.detach().cpu().numpy()
+
+    if return_logits:
+        if logits is None:
+            raise ValueError("No logits available to return. Set use_encoder_attr=False or ensure model returns logits.")
+        Z = logits.detach().cpu().numpy()
+        return H, Z
+
+    return H
+
+
+def load_pytorch_model(
+    model,
+    model_path: str,
+    optimizer=None,
+    map_location="cpu",
+    strict: bool = True,
+):
+    """
+    Load a PyTorch checkpoint saved with save_pytorch_model(..., save_entire_model=False).
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        An instantiated model with the same architecture as the saved one.
+    model_path : str
+        Path to the .pth checkpoint file.
+    optimizer : torch.optim.Optimizer | None
+        Optional optimizer to restore state into.
+    map_location : str or torch.device
+        Device mapping for torch.load.
+    strict : bool
+        Passed to model.load_state_dict(...).
+
+    Returns
+    -------
+    model : torch.nn.Module
+        Model with loaded weights.
+    optimizer : torch.optim.Optimizer | None
+        Optimizer with loaded state if provided and present in checkpoint.
+    extra : dict | None
+        Extra metadata saved in the checkpoint.
+    checkpoint : dict
+        Full loaded checkpoint.
+    """
+    checkpoint = torch.load(model_path, map_location=map_location)
+
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(
+            "Checkpoint does not contain 'model_state_dict'. "
+            "It may have been saved as a full model instead."
+        )
+
+    model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+
+    if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    extra = checkpoint.get("extra", None)
+    return model, optimizer, extra, checkpoint
 
 def indices_of_subset(arr: np.ndarray, subset: np.ndarray) -> np.ndarray:
     """
