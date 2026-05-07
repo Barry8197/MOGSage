@@ -13,6 +13,7 @@ Functions exported
 - split_edges_inductive
 - contrastive_distill_loss
 - per_class_metrics_from_scores
+- plot_per_class_confusion_matrices
 """
 
 import os
@@ -49,7 +50,97 @@ __all__ = [
     "split_edges_inductive",
     "contrastive_distill_loss",
     "per_class_metrics_from_scores"
+    "plot_per_class_confusion_matrices"
 ]
+
+def plot_per_class_confusion_matrices(
+    metrics_dict,
+    class_labels=None,
+    normalize="true",          # "true" | "pred" | "all" | None
+    show_counts=False,         # if True, annotate "prop\n(count)"
+    annotate_fmt=".2f",
+    figsize_per_plot=(4.2, 3.6),
+    cbar=True,
+):
+    """
+    Plot one-vs-rest 2x2 confusion matrices per class as proportions,
+    using the Wes Anderson 'Zissou' continuous colormap.
+
+    Expects:
+      metrics_dict['confusion'] with keys 'tp','fp','fn','tn' as arrays (n_classes,)
+    """
+    conf = metrics_dict["confusion"]
+    tp = np.asarray(conf["tp"], dtype=float)
+    fp = np.asarray(conf["fp"], dtype=float)
+    fn = np.asarray(conf["fn"], dtype=float)
+    tn = np.asarray(conf["tn"], dtype=float)
+
+    n_classes = tp.shape[0]
+    if class_labels is None:
+        class_labels = [f"Class {i}" for i in range(n_classes)]
+    if len(class_labels) != n_classes:
+        raise ValueError(f"Expected {n_classes} class_labels, got {len(class_labels)}")
+
+    # Wes Anderson palette via palettable: Zissou continuous colormap
+    from palettable.wesanderson import Zissou_5_r as _Z
+    cmap = _Z.mpl_colormap  # continuous matplotlib colormap
+
+    figs = []
+    for i, label in enumerate(class_labels):
+        cm_counts = np.array([[tp[i], fn[i]],
+                              [fp[i], tn[i]]], dtype=float)
+
+        # ---- normalize to proportions ----
+        if normalize is None:
+            cm = cm_counts
+        elif normalize == "true":
+            denom = cm_counts.sum(axis=1, keepdims=True)
+            cm = np.divide(cm_counts, denom, out=np.zeros_like(cm_counts), where=denom != 0)
+        elif normalize == "pred":
+            denom = cm_counts.sum(axis=0, keepdims=True)
+            cm = np.divide(cm_counts, denom, out=np.zeros_like(cm_counts), where=denom != 0)
+        elif normalize == "all":
+            denom = cm_counts.sum()
+            cm = cm_counts / denom if denom != 0 else np.zeros_like(cm_counts)
+        else:
+            raise ValueError('normalize must be one of: "true", "pred", "all", or None')
+
+        # ---- annotations ----
+        if show_counts and normalize is not None:
+            ann = np.empty_like(cm, dtype=object)
+            for r in range(2):
+                for c in range(2):
+                    ann[r, c] = f"{cm[r,c]:{annotate_fmt}}\n({int(cm_counts[r,c])})"
+            annot = ann
+            fmt = ""
+        else:
+            annot = True
+            fmt = annotate_fmt if normalize is not None else "d"
+
+        fig, ax = plt.subplots(figsize=figsize_per_plot)
+        sns.heatmap(
+            cm,
+            ax=ax,
+            annot=annot,
+            fmt=fmt,
+            cmap=cmap,
+            cbar=cbar,
+            vmin=0.0,
+            vmax=1.0 if normalize is not None else None,
+            square=True,
+            linewidths=1,
+            linecolor="white",
+            xticklabels=["Pred +", "Pred -"],
+            yticklabels=["True +", "True -"],
+        )
+        ax.set_title(f"{label} (one-vs-rest) — normalize={normalize}")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        plt.tight_layout()
+        figs.append(fig)
+
+    return figs
+
 
 def per_class_metrics_from_scores(y_pred: np.ndarray,
                                  y_true: np.ndarray,

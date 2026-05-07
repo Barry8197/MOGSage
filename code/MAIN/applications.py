@@ -10,6 +10,7 @@ Functions exported
 - eval_survival_model
 - visualise_feature_importance
 - make_survival_targets_from_death_df
+- plot_per_class_confusion_matrices
 """
 
 import copy
@@ -35,7 +36,151 @@ __all__ = [
     "eval_survival_model",
     "visualise_feature_importance",
     "make_survival_targets_from_death_df"
+    "plot_per_class_confusion_matrices"
 ]
+
+def plot_per_class_confusion_matrices(
+    metrics_dict,
+    class_labels=None,
+    normalize="true",          # "true" | "pred" | "all" | None
+    show_counts=False,         # if True, annotate "prop\n(count)"
+    annotate_fmt=".2f",
+    figsize_per_plot=(4.2, 3.6),
+    cbar=True,                 # one shared colorbar for the whole figure
+    max_cols=3,                # max columns per row of subplots
+    cbar_width=0.35,           # width (in “subplot-width units”) reserved for the colorbar
+):
+    """
+    Plot one-vs-rest 2x2 confusion matrices per class (optionally normalized),
+    arranged in a grid of subplots with up to `max_cols` columns, with a single
+    shared colorbar placed in a dedicated axis at the far right.
+
+    Expects:
+      metrics_dict['confusion'] with keys 'tp','fp','fn','tn' as arrays (n_classes,)
+    """
+    import math
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import matplotlib as mpl
+
+    conf = metrics_dict["confusion"]
+    tp = np.asarray(conf["tp"], dtype=float)
+    fp = np.asarray(conf["fp"], dtype=float)
+    fn = np.asarray(conf["fn"], dtype=float)
+    tn = np.asarray(conf["tn"], dtype=float)
+
+    n_classes = tp.shape[0]
+    if class_labels is None:
+        class_labels = [f"Class {i}" for i in range(n_classes)]
+    if len(class_labels) != n_classes:
+        raise ValueError(f"Expected {n_classes} class_labels, got {len(class_labels)}")
+
+    # Colormap (Wes Anderson Zissou)
+    from palettable.wesanderson import Zissou_5_r as _Z
+    cmap = _Z.mpl_colormap
+
+    n_cols = min(max_cols, n_classes)
+    n_rows = int(math.ceil(n_classes / n_cols))
+
+    # Figure size (add extra width for the colorbar column when enabled)
+    fig_w = figsize_per_plot[0] * n_cols + (figsize_per_plot[0] * cbar_width if cbar else 0.0)
+    fig_h = figsize_per_plot[1] * n_rows
+    fig = plt.figure(figsize=(fig_w, fig_h))
+
+    # GridSpec: last column reserved for colorbar (spans all rows)
+    gs = fig.add_gridspec(
+        nrows=n_rows,
+        ncols=n_cols + (1 if cbar else 0),
+        width_ratios=([1] * n_cols + ([cbar_width] if cbar else [])),
+        wspace=0.35,
+        hspace=0.55,
+    )
+
+    axes = np.empty((n_rows, n_cols), dtype=object)
+    for r in range(n_rows):
+        for c in range(n_cols):
+            axes[r, c] = fig.add_subplot(gs[r, c])
+
+    cax = fig.add_subplot(gs[:, -1]) if cbar else None  # dedicated colorbar axis
+
+    # Shared color scale
+    vmin = 0.0
+    if normalize is not None:
+        vmax = 1.0
+        cbar_label = "Proportion"
+    else:
+        vmax = float(np.max(np.array([tp, fp, fn, tn])))
+        cbar_label = "Count"
+
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+
+    for i, label in enumerate(class_labels):
+        r, c = divmod(i, n_cols)
+        ax = axes[r, c]
+
+        cm_counts = np.array([[tp[i], fn[i]],
+                              [fp[i], tn[i]]], dtype=float)
+
+        # ---- normalize ----
+        if normalize is None:
+            cm = cm_counts
+        elif normalize == "true":
+            denom = cm_counts.sum(axis=1, keepdims=True)
+            cm = np.divide(cm_counts, denom, out=np.zeros_like(cm_counts), where=denom != 0)
+        elif normalize == "pred":
+            denom = cm_counts.sum(axis=0, keepdims=True)
+            cm = np.divide(cm_counts, denom, out=np.zeros_like(cm_counts), where=denom != 0)
+        elif normalize == "all":
+            denom = cm_counts.sum()
+            cm = cm_counts / denom if denom != 0 else np.zeros_like(cm_counts)
+        else:
+            raise ValueError('normalize must be one of: "true", "pred", "all", or None')
+
+        # ---- annotations ----
+        if show_counts and normalize is not None:
+            ann = np.empty_like(cm, dtype=object)
+            for rr in range(2):
+                for cc in range(2):
+                    ann[rr, cc] = f"{cm[rr, cc]:{annotate_fmt}}\n({int(cm_counts[rr, cc])})"
+            annot = ann
+            fmt = ""
+        else:
+            annot = True
+            fmt = annotate_fmt if normalize is not None else "d"
+
+        sns.heatmap(
+            cm,
+            ax=ax,
+            annot=annot,
+            fmt=fmt,
+            cmap=cmap,
+            cbar=False,          # disable per-axes colorbar
+            vmin=vmin,
+            vmax=vmax,
+            square=True,
+            linewidths=1,
+            linecolor="white",
+            xticklabels=["Pred +", "Pred -"],
+            yticklabels=["True +", "True -"],
+        )
+        ax.set_title(f"{label} (one-vs-rest)\nnormalize={normalize}")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    # Hide unused subplot cells
+    for j in range(n_classes, n_rows * n_cols):
+        r, c = divmod(j, n_cols)
+        axes[r, c].axis("off")
+
+    # Shared colorbar
+    if cbar:
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        cb = fig.colorbar(sm, cax=cax)
+        cb.set_label(cbar_label)
+
+    return fig, axes
 
 def make_survival_targets_from_death_df(
     X,
