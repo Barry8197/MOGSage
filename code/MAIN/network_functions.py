@@ -25,6 +25,8 @@ Functions exported
 - load_graph
 - node_labels
 - knn_threshold
+- distances_to_similarity
+- edge_index_weighted_resample
 """
 
 import os
@@ -77,9 +79,113 @@ __all__ = [
     "drop_attrs_netx",
     "load_graph",
     "node_labels",
-    "knn_threshold"
+    "knn_threshold",
+    "distances_to_similarity",
+    "edge_index_weighted_resample"
     
 ]
+
+def edge_index_weighted_resample(edge_index, edge_weight, num_samples=None):
+    src, dst = edge_index.cpu()
+    w = edge_weight.detach().float().cpu()
+    w = torch.clamp(w, min=0)
+
+    if num_samples is None:
+        num_samples = edge_index.size(1)
+
+    probs = w / (w.sum() + 1e-12)
+    idx = torch.multinomial(probs, num_samples=num_samples, replacement=True)
+    return torch.stack([src[idx], dst[idx]], dim=0)
+
+def distances_to_similarity(
+    G: nx.Graph,
+    distance_attr: str = "weight",
+    out_attr: str = "similarity",
+    method: str = "inverse",          # "inverse" or "exponential"
+    tau: float | None = None,         # only used for exponential; if None uses median of distances
+    eps: float = 1e-12,               # numerical stability
+    overwrite: bool = True,
+    set_as_weight: bool = False,      # if True, also writes similarity into edge attribute "weight"
+):
+    """
+    Convert edge distances to similarities.
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Graph whose edges contain a distance attribute.
+    distance_attr : str
+        Edge attribute holding distances (default: "weight").
+    out_attr : str
+        Edge attribute name to write similarities to (default: "similarity").
+    method : str
+        "inverse"    -> sim = 1 / (1 + d)
+        "exponential"-> sim = exp(-d / tau)
+    tau : float or None
+        If method="exponential" and tau is None, tau is set to the median of all finite distances.
+    eps : float
+        Small constant to avoid division by zero / invalid tau.
+    overwrite : bool
+        If False, will not overwrite existing out_attr.
+    set_as_weight : bool
+        If True, also set edge attribute "weight" to the computed similarity.
+
+    Returns
+    -------
+    tau_used : float or None
+        Tau actually used (for exponential), else None.
+    """
+    # collect distances
+    dists = []
+    for _, _, data in G.edges(data=True):
+        d = data.get(distance_attr, None)
+        if d is None:
+            continue
+        try:
+            d = float(d)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(d):
+            dists.append(d)
+
+    if method not in {"inverse", "exponential"}:
+        raise ValueError("method must be 'inverse' or 'exponential'")
+
+    tau_used = None
+    if method == "exponential":
+        if tau is None:
+            if len(dists) == 0:
+                raise ValueError("No finite distances found; cannot set tau to median.")
+            tau_used = float(np.median(dists))
+        else:
+            tau_used = float(tau)
+        tau_used = max(tau_used, eps)
+
+    # write similarities
+    for u, v, data in G.edges(data=True):
+        if (not overwrite) and (out_attr in data):
+            continue
+
+        d = data.get(distance_attr, None)
+        if d is None:
+            continue
+        try:
+            d = float(d)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(d):
+            continue
+
+        if method == "inverse":
+            sim = 1.0 / (1.0 + max(d, 0.0))
+        else:
+            sim = np.float16(np.exp(-max(d, 0.0) / tau_used))
+
+        data[out_attr] = sim
+        if set_as_weight:
+            data["weight"] = sim
+
+    return tau_used
 
 def knn_threshold(
     G: nx.Graph,
@@ -612,89 +718,137 @@ def normalize_edges_similarity_from_node_attr(
 
     return G
 
-def build_phenotype_KG(df, id_col = 'ID', phenotype_col = 'Phenotype', min_weight=1, onehot_dtype=np.uint8):
+def build_phenotype_KG(
+    df,
+    id_col: str = "ID",
+    phenotype_col: str = "Phenotype",
+    weight_col: str | None = None,   # if provided -> use euclidean-over-shared logic below
+    min_weight: float = 1,
+    onehot_dtype=np.uint8,
+):
     """
-    Build an undirected NetworkX graph where nodes are eids, edges connect eids
-    that share >=1 phecode, and edge weight is the number of shared phenotypes.
-    Additionally, attach node features:
-      - 'pheno_onehot': 0/1 one-hot vector over all phenotypes
-      - 'phenotypes': list of phenotypes the eid has
+    Build an undirected NetworkX graph where nodes are IDs, edges connect IDs
+    that share >=1 phenotype.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must have columns [id_col, phenotype_col] (other columns are ignored).
-    min_weight : int
-        Keep edges with weight >= min_weight.
-    onehot_dtype : np.dtype
-        Dtype for the one-hot arrays (np.uint8 or bool recommended).
+    Edge weight:
+      - If weight_col is None:
+          weight(i,j) = number of shared phenotypes
+      - If weight_col is provided:
+          For each shared phenotype p, compute per-phenotype distance:
+              d_p(i,j) = |w(i,p) - w(j,p)|
+          and then SUM over shared phenotypes:
+              weight(i,j) = sum_{p in shared(i,j)} d_p(i,j)
 
-    Returns
-    -------
-    G : networkx.Graph
-        Graph with node attributes:
-          - G.nodes[id_col][phenotype_col_onehot] : np.ndarray shape (n_phenotypes,)
-          - G.nodes[id_col][phenotype_col]       : list of phecode values
-        And graph-level attribute:
-          - G.graph['phenotype_col_categories']  : list giving the index order used in one-hots
+        (This is the sum of Euclidean distances in 1D per shared phenotype; equivalently an L1 sum
+         over phenotypes of absolute differences, restricted to shared phenotypes.)
+
+    Node attributes:
+      - 'pheno_onehot': 0/1 one-hot over all phenotypes (presence)
+      - 'phenotypes': list of phenotypes for that ID
+      - 'phenotype_weights': dict {phenotype: weight} if weight_col is provided
     """
-    # Use only eid/phecode, drop NaNs and duplicates
-    df = df[[id_col, phenotype_col]].dropna().drop_duplicates()
+    # -------------------- Select + clean --------------------
+    use_cols = [id_col, phenotype_col] + ([weight_col] if weight_col else [])
+    df = df[use_cols].copy()
+    df = df.dropna(subset=[id_col, phenotype_col])
 
-    # Map ids to category codes (gives us a consistent index order)
-    ids = df[id_col].astype('category')
-    phe  = df[phenotype_col].astype('category')
+    if weight_col is None:
+        df = df.drop_duplicates([id_col, phenotype_col])
+    else:
+        df[weight_col] = pd.to_numeric(df[weight_col], errors="coerce")
+        df = df.dropna(subset=[weight_col])
+        # if multiple rows per (ID, phenotype), sum them
+        df = df.groupby([id_col, phenotype_col], as_index=False)[weight_col].sum()
+
+    # -------------------- Category coding --------------------
+    ids = df[id_col].astype("category")
+    phe = df[phenotype_col].astype("category")
     id_codes = ids.cat.codes.to_numpy()
     phe_codes = phe.cat.codes.to_numpy()
 
-    n_e = ids.cat.categories.size
-    n_p = phe.cat.categories.size
-
-    # Build bipartite incidence matrix B (ids x phenotypes), entries 1 if present
-    data = np.ones(len(df), dtype=np.int32)
-    B = coo_matrix((data, (id_codes, phe_codes)), shape=(n_e, n_p)).tocsr()
-
-    # Initialize graph and record the phecode order used in one-hots
-    G = nx.Graph()
     id_values = ids.cat.categories.tolist()
     phe_values = phe.cat.categories.tolist()
-    print(phe_values)
-    G.add_nodes_from(id_values)
-    G.graph['phecode_categories'] = phe_values  # interpret one-hot indices using this list
+    n_e = len(id_values)
+    n_p = len(phe_values)
 
-    # Attach node features
-    # For each id (row i of B), get indices of nonzero phenotypes and build:
-    #  - list of phenotypes (original values)
-    #  - one-hot vector (dense). For large n_p, this can be memory-heavy.
-    #    If memory is tight, consider:
-    #      - storing just the indices as 'phecode_indices' instead of a dense vector, or
-    #      - using np.packbits(onehot.astype(np.uint8)) to store a compact bytes array.
+    # -------------------- Build incidence --------------------
+    if weight_col is None:
+        data = np.ones(len(df), dtype=np.float32)
+    else:
+        data = df[weight_col].to_numpy(dtype=np.float32)
+
+    B = coo_matrix((data, (id_codes, phe_codes)), shape=(n_e, n_p)).tocsr()
+
+    # -------------------- Graph init + node attrs --------------------
+    G = nx.Graph()
+    G.add_nodes_from(id_values)
+    G.graph["phecode_categories"] = phe_values
+
     indptr = B.indptr
     indices = B.indices
-    for i, idx in enumerate(id_values):
-        col_idx = indices[indptr[i]:indptr[i+1]]  # phecode indices for this id
-        # Dense one-hot vector
+    bdata = B.data
+
+    for i, node_id in enumerate(id_values):
+        cols = indices[indptr[i] : indptr[i + 1]]
+
         onehot = np.zeros(n_p, dtype=onehot_dtype)
-        if len(col_idx) > 0:
-            onehot[col_idx] = 1
-        # List of phenotypes (original values)
-        phe_list = [phe_values[j] for j in col_idx]
-        # Set node attributes
-        G.nodes[idx]['pheno_onehot'] = onehot
-        G.nodes[idx]['phenotypes'] = phe_list
+        if cols.size:
+            onehot[cols] = 1
 
-    # Project: S = B * B^T gives number of shared phenotypes between ids
-    S = B @ B.T
-    S.setdiag(0)
-    S.eliminate_zeros()
+        G.nodes[node_id]["pheno_onehot"] = onehot
+        G.nodes[node_id]["phenotypes"] = [phe_values[j] for j in cols]
 
-    # Add weighted edges (iterate upper triangle to avoid duplicates)
-    S_coo = S.tocoo()
-    for i, j, w in zip(S_coo.row, S_coo.col, S_coo.data):
-        if i < j and w >= min_weight:
-            ei = id_values[i]
-            ej = id_values[j]
-            G.add_edge(ei, ej, weight=int(w))
+        if weight_col is not None:
+            vals = bdata[indptr[i] : indptr[i + 1]]
+            G.nodes[node_id]["phenotype_weights"] = {
+                phe_values[j]: float(v) for j, v in zip(cols, vals)
+            }
+
+    # -------------------- Edge construction --------------------
+    if weight_col is None:
+        S = B @ B.T
+        S.setdiag(0)
+        S.eliminate_zeros()
+
+        S_coo = S.tocoo()
+        for i, j, w in zip(S_coo.row, S_coo.col, S_coo.data):
+            if i < j and w >= min_weight:
+                G.add_edge(id_values[i], id_values[j], weight=int(w))
+        return G
+
+    # For each phenotype column p, take IDs that have p and add |w_i - w_j| to that pair's edge weight.
+    #
+    # Implementation: iterate phenotypes; for each, gather (id_index, weight) then accumulate pairwise diffs.
+    # This is O(sum_p k_p^2) where k_p = #IDs having phenotype p.
+    # Works well if phenotypes are not extremely dense.
+    Bw = B.tocsc()  # efficient column access
+
+    edge_accum = {}  # (i,j) -> summed distance
+
+    for p in range(n_p):
+        col = Bw.getcol(p)
+        rows = col.indices
+        vals = col.data
+
+        k = len(rows)
+        if k < 2:
+            continue
+
+        # accumulate for all unordered pairs in this phenotype
+        # contribution is Euclidean distance in 1D => abs difference
+        for a in range(k - 1):
+            ia = rows[a]
+            wa = vals[a]
+            for b in range(a + 1, k):
+                ib = rows[b]
+                wb = vals[b]
+                i, j = (ia, ib) if ia < ib else (ib, ia)
+                edge_accum[(i, j)] = edge_accum.get((i, j), 0.0) + float(abs(wa - wb))
+
+    # add edges meeting threshold
+    for (i, j), w in edge_accum.items():
+        if w >= min_weight:
+            G.add_edge(id_values[i], id_values[j], weight=float(w))
 
     return G
 

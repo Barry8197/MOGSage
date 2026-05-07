@@ -5,10 +5,11 @@ Functions exported
 - LabelPowerset
 - RAkEL
 - plot_model_comparison
-- plot_risk_stratified_km
+- plot_km_by_group
 - plot_overall_km
 - eval_survival_model
 - visualise_feature_importance
+- make_survival_targets_from_death_df
 """
 
 import copy
@@ -29,18 +30,324 @@ __all__ = [
     "LabelPowerset",
     "RAkEL",
     "plot_model_comparison",
-    "plot_risk_stratified_km",
+    "plot_km_by_group",
     "plot_overall_km",
     "eval_survival_model",
-    "visualise_feature_importance"
+    "visualise_feature_importance",
+    "make_survival_targets_from_death_df"
 ]
+
+def make_survival_targets_from_death_df(
+    X,
+    death_df: pd.DataFrame,
+    id_col: str = "ID",
+    death_col: str = "DEATH_DATE",
+    sample_col: str = "SAMPLE_DATE",
+    censor_date=None,
+    censor_strategy: str = "global_max",
+    return_linpred: bool = True,
+):
+    """
+    Derive survival durations, event indicators, and an optional linear predictor
+    from a death dataframe aligned with embedding matrix X.
+
+    Parameters
+    ----------
+    X : array-like, shape (N, D)
+        Embedding matrix. Must have the same number of rows as death_df.
+    death_df : pd.DataFrame
+        Must contain columns for sample date (time zero) and death date.
+    id_col : str
+        Column name for subject IDs (informational only).
+    death_col : str
+        Column name for death dates (NaT if unknown / censored).
+    sample_col : str
+        Column name for baseline sample dates (time zero).
+    censor_date : str or pd.Timestamp, optional
+        Administrative censoring date. Required when censor_strategy="given".
+    censor_strategy : {"global_max", "given"}
+        "global_max" uses the latest observed date in the dataset;
+        "given" uses the provided censor_date.
+    return_linpred : bool
+        If True, also return a standardised linear predictor derived from X.
+
+    Returns
+    -------
+    durations : ndarray, shape (N,)  — follow-up time in days (>= 1e-3).
+    events    : ndarray, shape (N,)  — 1 if death observed, 0 if censored.
+    linpred   : ndarray, shape (N,)  — optional risk score derived from X.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    N = X.shape[0]
+
+    if len(death_df) != N:
+        raise ValueError(
+            f"Row mismatch: X has {N} rows but death_df has {len(death_df)} rows. "
+            "Align them to the same order first."
+        )
+
+    d = death_df.copy()
+    d[death_col]  = pd.to_datetime(d[death_col],  errors="coerce")
+    d[sample_col] = pd.to_datetime(d[sample_col], errors="coerce")
+
+    if d[sample_col].isna().any():
+        bad = d.index[d[sample_col].isna()][:5].tolist()
+        raise ValueError(f"Found NaT in {sample_col} (baseline). Example rows: {bad}")
+
+    # Censor date
+    if censor_strategy == "given":
+        if censor_date is None:
+            raise ValueError("censor_strategy='given' requires censor_date.")
+        censor_date = pd.to_datetime(censor_date)
+    elif censor_strategy == "global_max":
+        max_death  = d[death_col].max(skipna=True)
+        max_sample = d[sample_col].max(skipna=True)
+        censor_date = max(dt for dt in [max_death, max_sample] if pd.notna(dt))
+    else:
+        raise ValueError("censor_strategy must be 'global_max' or 'given'.")
+
+    # Durations and events
+    baseline = d[sample_col]
+    death_dt = d[death_col]
+    events   = (death_dt.notna() & (death_dt <= censor_date)).astype(np.int32).to_numpy()
+    exit_date = death_dt.where((death_dt.notna() & (death_dt <= censor_date)), censor_date)
+    durations = ((exit_date - baseline) / np.timedelta64(1, "D")).to_numpy(dtype=np.float64)
+    durations = np.clip(durations, 1e-3, None)
+
+    if not return_linpred:
+        return durations, events
+
+    # Deterministic linear predictor from X
+    Z = (X - X.mean(axis=0, keepdims=True)) / (X.std(axis=0, keepdims=True) + 1e-8)
+    p = min(8, Z.shape[1])
+    w = np.linspace(0.6, 0.2, p)
+    linpred = Z[:, :p] @ w
+    if p >= 3:
+        linpred = linpred + 0.25 * Z[:, 0] * Z[:, 1] - 0.15 * (Z[:, 2] ** 2)
+    linpred = (linpred - linpred.mean()) / (linpred.std() + 1e-8)
+
+    return durations, events, linpred
+
+def plot_km_by_group(
+    results,
+    df_test,
+    durations,
+    events,
+    groups,
+    model_name="Cox PH",
+    group_label="Group",
+    times=None,
+    order_by="mean_risk",
+    min_group_size=10,
+    ci_show=False,
+    title=None,
+    palette=None,
+):
+    """
+    Plot Kaplan–Meier curves per group using a pre-fitted survival model for
+    risk scoring. Pairwise log-rank tests are run between all group pairs and
+    an overall significance annotation is added to the plot.
+
+    Parameters
+    ----------
+    results : list[dict] or dict
+        Output of eval_survival_model calls. Each dict must contain at minimum
+        {"Model": str, "model": fitted lifelines model}.
+    df_test : pd.DataFrame
+        Test covariates (may include "time"/"event" columns — ignored for prediction).
+    durations, events : array-like
+        Observed follow-up times and event indicators for df_test rows.
+    groups : array-like
+        Group label per row in df_test (e.g. cluster id, phenotype label).
+    model_name : str
+        Key to select a model from results (matches "Model" field).
+    group_label : str
+        Human-readable name for the grouping variable used in the legend and
+        axis labels (e.g. "Cluster", "Subtype", "Label").
+    times : array-like or None
+        Optional time grid to restrict the x-axis (xlim).
+    order_by : {"mean_risk", "median_risk", None}
+        How to order groups in the legend.
+    min_group_size : int
+        Groups smaller than this are excluded.
+    ci_show : bool
+        Show 95 % confidence bands on KM curves.
+    title : str or None
+        Plot title. Defaults to a sensible automatic title.
+    palette : list or None
+        Matplotlib colour list. Falls back to the current colour cycle.
+
+    Returns
+    -------
+    risk_scores : ndarray, shape (N,)
+        Predicted risk scores for all test samples.
+    group_info : list of tuples
+        (group_label, n, mean_risk, median_risk) sorted as plotted.
+    pairwise_results : list of dicts
+        Log-rank test results for each pair of groups.
+    """
+    # ── Resolve model ─────────────────────────────────────────────────────────
+    if isinstance(results, dict):
+        res = results
+    else:
+        matches = [r for r in results if r.get("Model") == model_name]
+        if not matches:
+            available = [r.get("Model") for r in results]
+            raise ValueError(f"Model '{model_name}' not found. Available: {available}")
+        res = matches[0]
+
+    mdl = res.get("model")
+    if mdl is None:
+        raise ValueError("Selected results entry has no fitted model under key 'model'.")
+
+    durations = np.asarray(durations, dtype=float)
+    events    = np.asarray(events,    dtype=int)
+    groups    = np.asarray(groups)
+
+    if not (len(df_test) == len(durations) == len(events) == len(groups)):
+        raise ValueError("df_test, durations, events, and groups must all have the same length.")
+
+    # ── Risk scores ───────────────────────────────────────────────────────────
+    X = df_test.drop(columns=[c for c in ["time", "event"] if c in df_test.columns], errors="ignore")
+    if hasattr(mdl, "predict_partial_hazard"):
+        risk_scores = np.asarray(mdl.predict_partial_hazard(X)).reshape(-1)
+    elif "risk_scores" in res:
+        risk_scores = np.asarray(res["risk_scores"]).reshape(-1)
+    else:
+        raise ValueError(
+            "Model has no predict_partial_hazard method and no 'risk_scores' key in results."
+        )
+
+    # ── Filter and sort groups ────────────────────────────────────────────────
+    unique     = np.unique(groups)
+    group_info = []
+    for g in unique:
+        mask = groups == g
+        n    = int(mask.sum())
+        if n < min_group_size:
+            continue
+        rs = risk_scores[mask]
+        group_info.append((g, n, float(rs.mean()), float(np.median(rs))))
+
+    if not group_info:
+        raise ValueError("No groups remain after applying min_group_size filter.")
+
+    sort_key = {"mean_risk": 2, "median_risk": 3}.get(order_by)
+    if sort_key is not None:
+        group_info.sort(key=lambda x: x[sort_key])
+
+    # ── Pairwise log-rank tests ───────────────────────────────────────────────
+    from lifelines.statistics import logrank_test
+
+    pairwise_results = []
+    group_ids = [gi[0] for gi in group_info]
+
+    for i in range(len(group_ids)):
+        for j in range(i + 1, len(group_ids)):
+            g_i, g_j = group_ids[i], group_ids[j]
+            m_i = groups == g_i
+            m_j = groups == g_j
+            lr  = logrank_test(
+                durations[m_i], durations[m_j],
+                event_observed_A=events[m_i],
+                event_observed_B=events[m_j],
+            )
+            pairwise_results.append({
+                "group_A":    g_i,
+                "group_B":    g_j,
+                "test_stat":  lr.test_statistic,
+                "p_value":    lr.p_value,
+                "significant": lr.p_value < 0.05,
+            })
+
+    # Determine overall significance (any pair significant after Bonferroni)
+    n_tests       = len(pairwise_results)
+    p_values      = [r["p_value"] for r in pairwise_results]
+    min_p         = min(p_values) if p_values else 1.0
+    bonferroni_p  = min(min_p * n_tests, 1.0)   # Bonferroni corrected
+    any_sig       = bonferroni_p < 0.05
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    colors = palette if palette else plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    kmf    = KaplanMeierFitter()
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    for idx, (g, n, mean_risk, med_risk) in enumerate(group_info):
+        mask  = groups == g
+        color = colors[idx % len(colors)]
+        label = f"{group_label} {g}  (n={n}, mean risk={mean_risk:.2f})"
+        kmf.fit(durations[mask], events[mask], label=label)
+        kmf.plot_survival_function(ax=ax, ci_show=ci_show, linewidth=2, color=color)
+
+    if title is None:
+        title = f"Kaplan–Meier by {group_label} (risk scored by: {model_name})"
+    ax.set_title(title, pad=14)
+    ax.set_xlabel("Time (days)")
+    ax.set_ylabel("Survival probability")
+
+    if times is not None:
+        ax.set_xlim(np.min(times), np.max(times))
+
+    # ── Significance annotation ───────────────────────────────────────────────
+    if pairwise_results:
+        def _p_stars(p):
+            if p < 0.001: return "***"
+            if p < 0.01:  return "**"
+            if p < 0.05:  return "*"
+            return "ns"
+
+        # Build compact annotation string for pairwise comparisons
+        pair_lines = [
+            f"{group_label} {r['group_A']} vs {group_label} {r['group_B']}: "
+            f"p={r['p_value']:.3g} {_p_stars(r['p_value'])}"
+            for r in pairwise_results
+        ]
+        sig_summary = (
+            f"Overall (Bonferroni): p={bonferroni_p:.3g} {_p_stars(bonferroni_p)}"
+            + (" — groups differ significantly" if any_sig else " — no significant difference")
+        )
+        annotation = "\n".join(pair_lines + ["", sig_summary])
+
+        ax.text(
+            0.98, 0.97,
+            annotation,
+            transform=ax.transAxes,
+            ha="right", va="top",
+            fontsize=9,
+            bbox=dict(
+                boxstyle="round,pad=0.4",
+                facecolor="white",
+                edgecolor="grey",
+                alpha=0.85,
+            ),
+        )
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print pairwise table
+    print("\nPairwise log-rank tests:")
+    print(f"{'Group A':<12} {'Group B':<12} {'Test stat':>10} {'p-value':>10} {'Sig':>6}")
+    print("-" * 55)
+    for r in pairwise_results:
+        print(
+            f"{str(r['group_A']):<12} {str(r['group_B']):<12} "
+            f"{r['test_stat']:>10.4f} {r['p_value']:>10.4g} "
+            f"{'*' if r['significant'] else '':>6}"
+        )
+    print(f"\nBonferroni-corrected minimum p: {bonferroni_p:.4g}  "
+          f"({'significant' if any_sig else 'not significant'} at α=0.05)")
+
+    return risk_scores, group_info, pairwise_results, fig
+
 
 def visualise_feature_importance(
     importances,
+    mod_dim,
     top_n: int = 10,
     title: str | None = None,
     xlabel: str = "Mean |Conductance|",
-    palette_color_index: int = 1,
     figsize: tuple[int, int] = (12, 8),
     context: str = "talk",
     style: str = "whitegrid",
@@ -53,70 +360,89 @@ def visualise_feature_importance(
     tight_layout: bool = True,
     show: bool = True,
     ax=None,
+    # --- modality colouring options ---
+    modality_labels=None,              # e.g. ["omics", "imaging", "text"]
+    palette=Darjeeling2_5.mpl_colors,   # 5 colours
+    legend_title: str = "Modality",
 ):
     """
-    Plot top-N features by mean absolute importance (e.g., layer conductance).
+    Plot top-N features by variance (as written) and colour bars by modality.
+
+    Modalities are defined by mod_dim, e.g. [766, 1029, 345] meaning:
+      modality 1: features [0, 766)
+      modality 2: features [766, 766+1029)
+      modality 3: features [766+1029, 766+1029+345)
 
     Parameters
     ----------
     importances : pd.DataFrame or array-like
-        Feature importances with features along columns. Typically shape (n_samples, n_features).
-        If a DataFrame is provided, column names are used as feature labels.
+        Feature scores with shape (n_samples, n_features).
+        If DataFrame: columns used as feature labels (and assumed ordered to match mod_dim).
+    mod_dim : list[int]
+        Number of features per modality, in the same order as concatenation.
     top_n : int
         Number of top features to display.
-    title : str or None
-        Plot title. If None, a default title is used.
-    xlabel : str
-        X-axis label.
-    palette_color_index : int
-        Index into Darjeeling2_5.mpl_colors for bar colour.
-    figsize : (int, int)
-        Figure size if a new figure is created.
-    context, style : str
-        Seaborn theme settings.
-    min_alpha, max_alpha : float
-        Alpha range to fade lower-importance bars.
-    value_fmt : str
-        Format string for value labels, e.g. "{:.3f}".
-    value_fontsize : int
-        Font size for value labels.
-    value_offset : (float, float)
-        Offset in points for value labels relative to the bar end.
-    despine : bool
-        If True, call sns.despine().
-    tight_layout : bool
-        If True, call plt.tight_layout().
-    show : bool
-        If True, call plt.show().
-    ax : matplotlib.axes.Axes or None
-        If provided, draw onto this axis; otherwise create a new figure/axis.
-
-    Returns
-    -------
-    fig, ax, df_plot
-        Matplotlib figure/axis and the plotting DataFrame (Feature, Importance).
+    modality_labels : list[str] or None
+        Optional names for modalities; if None uses "Mod 1", "Mod 2", ...
+    palette : list
+        List of colours (e.g., Darjeeling2_5.mpl_colors). If #modalities > len(palette),
+        colours cycle.
     """
+
+    def _feature_index_to_modality(idx: int, mod_dim_list) -> int:
+        """Return modality id in {0,1,2,...} for a feature index."""
+        cum = np.cumsum([0] + list(mod_dim_list))  # length M+1
+        # Find m s.t. cum[m] <= idx < cum[m+1]
+        # np.searchsorted returns insertion point; subtract 1 to get bin index
+        m = int(np.searchsorted(cum, idx, side="right") - 1)
+        return m
+
     # Coerce to DataFrame for consistent handling
     if isinstance(importances, pd.DataFrame):
-        imp_df = importances
+        imp_df = importances.copy()
     else:
         imp_df = pd.DataFrame(importances)
 
-    # Compute global importance: mean absolute importance per feature
-    feat_imp = (
-        imp_df.abs()
-        .mean(axis=0)
-        .sort_values(ascending=False)
-        .head(top_n)
-    )
+    n_features = imp_df.shape[1]
+    if sum(mod_dim) != n_features:
+        raise ValueError(
+            f"sum(mod_dim)={sum(mod_dim)} but importances has n_features={n_features}. "
+            "These must match (assuming modalities concatenated in-order)."
+        )
 
-    # Put into plotting DataFrame (ascending for barh)
+    n_mods = len(mod_dim)
+    if modality_labels is None:
+        modality_labels = [f"Mod {i+1}" for i in range(n_mods)]
+    if len(modality_labels) != n_mods:
+        raise ValueError("modality_labels must have the same length as mod_dim.")
+
+    # Compute global importance: variance per feature (matches your current code)
+    feat_imp = imp_df.var().sort_values(ascending=False).head(top_n)
+
+    # Build plotting DataFrame
     df_plot = feat_imp.sort_values(ascending=True).reset_index()
     df_plot.columns = ["Feature", "Importance"]
 
+    # Determine original feature index (position in imp_df columns)
+    # - If columns are not unique, get_loc can return slice/array; handle by using enumerated mapping.
+    col_to_pos = {col: i for i, col in enumerate(imp_df.columns)}
+    df_plot["FeatureIndex"] = df_plot["Feature"].map(col_to_pos)
+
+    if df_plot["FeatureIndex"].isna().any():
+        # Fallback: if mapping failed (e.g., duplicate column names), use slower but reliable approach
+        # by matching on both name and rank; but simplest is to require unique columns.
+        raise ValueError(
+            "Could not map feature names back to column positions. "
+            "Ensure imp_df.columns are unique or pass a DataFrame with unique column names."
+        )
+
+    # Assign modality id/label and colour
+    df_plot["ModalityId"] = df_plot["FeatureIndex"].apply(lambda i: _feature_index_to_modality(int(i), mod_dim))
+    df_plot["Modality"] = df_plot["ModalityId"].apply(lambda m: modality_labels[m])
+    df_plot["Color"] = df_plot["ModalityId"].apply(lambda m: palette[m % len(palette)])
+
     # Style
     sns.set_theme(style=style, context=context)
-    base_color = Darjeeling2_5.mpl_colors[palette_color_index]
 
     # Figure / axis
     if ax is None:
@@ -124,8 +450,8 @@ def visualise_feature_importance(
     else:
         fig = ax.figure
 
-    # Draw bars
-    bars = ax.barh(df_plot["Feature"], df_plot["Importance"], color=base_color)
+    # Draw bars with per-bar colours
+    bars = ax.barh(df_plot["Feature"], df_plot["Importance"], color=df_plot["Color"].tolist())
 
     # Fade lower-importance features by alpha
     if len(df_plot) > 0 and df_plot["Importance"].max() > 0:
@@ -146,7 +472,7 @@ def visualise_feature_importance(
     ax.set_ylabel("")
     ax.grid(False)
 
-    # Add value labels
+    # Value labels
     for bar in bars:
         width = bar.get_width()
         ax.annotate(
@@ -158,6 +484,14 @@ def visualise_feature_importance(
             xytext=value_offset,
             textcoords="offset points",
         )
+
+    # Legend (one entry per modality present in the plotted top_n)
+    present = df_plot[["Modality", "Color"]].drop_duplicates().sort_values("Modality")
+    handles = [
+        plt.Line2D([0], [0], color=row["Color"], lw=8)
+        for _, row in present.iterrows()
+    ]
+    ax.legend(handles, present["Modality"].tolist(), title=legend_title, loc="best", frameon=True)
 
     if despine:
         sns.despine()
@@ -213,48 +547,6 @@ def plot_overall_km(durations, events, title="Overall Kaplan–Meier Curve", COL
         color=COL,
         ci_alpha=0.20
     )
-    ax.set_title(title)
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Survival probability")
-    sns.despine()
-    plt.tight_layout()
-    plt.show()
-
-def plot_risk_stratified_km(durations, events, risk_scores, title, COL_1 = 'b', COL_2 = 'y'):
-    risk_scores = np.asarray(risk_scores).reshape(-1)
-    threshold = np.median(risk_scores)
-    high_risk = risk_scores >= threshold
-    low_risk  = ~high_risk
-
-    kmf_low = KaplanMeierFitter()
-    kmf_high = KaplanMeierFitter()
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    kmf_low.fit(
-        durations[low_risk],
-        event_observed=events[low_risk],
-        label="Low risk"
-    )
-    kmf_high.fit(
-        durations[high_risk],
-        event_observed=events[high_risk],
-        label="High risk"
-    )
-
-    kmf_low.plot_survival_function(
-        ax=ax,
-        ci_show=True,
-        color=COL_1,
-        ci_alpha=0.18
-    )
-    kmf_high.plot_survival_function(
-        ax=ax,
-        ci_show=True,
-        color=COL_2,
-        ci_alpha=0.18
-    )
-
     ax.set_title(title)
     ax.set_xlabel("Time")
     ax.set_ylabel("Survival probability")

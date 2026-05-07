@@ -80,7 +80,7 @@ class EarlyStopping:
         self.stop       = False
 
     def step(self, score, model):
-        if self.best_score is None or score > self.best_score + self.min_delta:
+        if self.best_score is None or score < self.best_score - self.min_delta:
             self.best_score = score
             self.best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             self.counter    = 0
@@ -276,75 +276,6 @@ class MOGSage(nn.Module):
 
         self.drop = nn.Dropout(dropout)
 
-    # --------- Utilities for cached medians ----------
-    def _get_enc_median(self, i: int) -> torch.Tensor:
-        return getattr(self, f"_enc_median_{i}")
-
-    @torch.no_grad()
-    def update_latent_medians_from_train(self, feat_train: torch.Tensor, device=None):
-        """
-        Compute per-modality median latent vector on TRAIN features once per epoch and cache it.
-        Assumes each modality has at least one valid (non-NaN) row.
-
-        feat_train: [N_train, sum(input_dims)] tensor for TRAIN nodes only (raw input features).
-        """
-        was_training = self.training
-        self.eval()
-
-        if device is None:
-            device = next(self.parameters()).device
-
-        prev = 0
-        for i, (enc, dim) in enumerate(zip(self.encoder_dims, self.input_dims)):
-            h_mod = feat_train[:, prev:prev + dim].to(device)  # [N_train, dim]
-            prev += dim
-
-            valid = ~torch.isnan(h_mod).any(dim=1)
-            # Only encode non-NaN rows to compute a clean median in latent space:
-            enc_valid = enc(h_mod[valid])  # [N_valid, D]
-            med = enc_valid.median(dim=0).values.detach()  # [D]
-
-            name = f"_enc_median_{i}"
-            if not hasattr(self, name):
-                self.register_buffer(name, med.clone())
-            else:
-                getattr(self, name).copy_(med)
-
-        if was_training:
-            self.train()
-
-    # --------- Core: Modality encoding + imputation ----------
-    def _encode_modalities_with_cached_median(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [N, sum(input_dims)] for either all nodes (full graph) or the sampled nodes (neighbor sampling).
-        Returns: [N, decoder_dim] mean-pooled across modalities, where per-modality missing feature rows
-                 are replaced by the cached median (computed on TRAIN set).
-        """
-        N = x.size(0)
-        chunks = []
-        prev = 0
-        device = x.device
-
-        for i, (enc, dim) in enumerate(zip(self.encoder_dims, self.input_dims)):
-            h_mod = x[:, prev:prev + dim]               # [N, dim]
-            prev += dim
-
-            miss = torch.isnan(h_mod).any(dim=1)        # [N]
-            # encode only valid rows:
-            enc_valid = enc(h_mod[~miss])               # [N_valid, D]
-            D = enc_valid.shape[1]
-
-            enc_full = h_mod.new_zeros((N, D))          # same device/dtype
-            enc_full[~miss] = enc_valid
-            # impute with cached median for this modality:
-            enc_full[miss] = self._get_enc_median(i).to(device)
-
-            chunks.append(enc_full)
-
-        # Mean across modalities -> [N, decoder_dim]
-        h = torch.stack(chunks, dim=0).mean(dim=0)
-        return h
-
     # --------- Forward ----------
     def forward(
         self,
@@ -363,8 +294,21 @@ class MOGSage(nn.Module):
         if (edge_index is None):
             raise ValueError("Provide (edge_index).")
 
-        # 1) Encode modalities with cached TRAIN medians for missing rows
-        h = self._encode_modalities_with_cached_median(x)
+        N = x.size(0)
+        chunks = []
+        prev = 0
+        device = x.device
+
+        for i, (enc, dim) in enumerate(zip(self.encoder_dims, self.input_dims)):
+            h_mod = x[:, prev:prev + dim]               # [N, dim]
+            prev += dim
+
+            # encode only valid rows: 
+            chunks.append(enc(h_mod))
+
+        # Mean across modalities -> [N, decoder_dim]
+        h = torch.stack(chunks, dim=0).mean(dim=0)
+        h = self.drop(h)
 
         # 2) GNN propagation
         for l in range(len(self.convs)):
@@ -372,6 +316,9 @@ class MOGSage(nn.Module):
             h = self.bns[l](h)
             h = F.relu(h)
 
+            h = self.drop(h)
+
+        h = self.drop(h)
         # 3) Classifier
         logits = self.classifier(h)
         return h, logits
@@ -465,7 +412,6 @@ class MOGSage(nn.Module):
                 batch_size = int(batch.batch_size)
                 n_id = batch.n_id
                 edge_index = batch.edge_index
-    
                 # Features for all sampled nodes in this subgraph
                 if feat_all is not None:
                     x = feat_all[n_id].to(device)
@@ -487,24 +433,33 @@ class MOGSage(nn.Module):
                 # Current modality slice
                 slc = x[:, prev_dim:prev_dim + dim]                      # [n_subgraph_nodes, dim]
                 nan_rows = torch.isnan(slc).any(dim=1)                   # rows missing this modality
-    
-                unique_targets = y_pred.unique().tolist()
 
+                unique_targets = y_pred.unique().tolist()
+                n = x.shape[0]
+                
                 for target_class in unique_targets:
                     cond_attr = cond.attribute(
                         inputs=x,
                         target=int(target_class),
                         additional_forward_args=edge_index,
-                        internal_batch_size=min(128, x.size(0)),
+                        internal_batch_size=x.size(0),
                         attribute_to_layer_input=True,
                         n_steps=10,
                     )
                     # cond_attr shape should align with encoder layer input, i.e. raw modality dim
                     cond_attr = cond_attr.clone()
-                    cond_attr[nan_rows] = 0.0
+
+                    imputed_idx = torch.where(nan_rows)[0]
+                    reindex = list(range(n))
+                    for imp_idx in imputed_idx :
+                        reindex.insert(imp_idx, reindex[-1])  # Insert the last index at the desired position
+                        del reindex[-1]
+    
+                    cond_imputed = torch.concat([cond_attr , torch.zeros(n , cond_attr.shape[1], device=device)])[reindex]
+                    cond_imputed[nan_rows] = 0.0
     
                     # keep only root nodes
-                    cond_out = cond_attr[:batch_size, :dim]
+                    cond_out = cond_imputed[:batch_size, :dim]
     
                     out_nodes = n_id[:batch_size]                        # global IDs of root nodes
                     mask = (y_pred == int(target_class))

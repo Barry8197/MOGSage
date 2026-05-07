@@ -13,6 +13,8 @@ Functions exported
 - extract_node_embeddings_fullgraph
 - save_gnn_embeddings_pickle
 - save_pytorch_model
+- median_impute_per_column
+- load_pytorch_model
 """
 import os
 import warnings
@@ -40,8 +42,40 @@ __all__ = [
     "get_split_indices_from_masks",
     "extract_node_embeddings_fullgraph",
     "save_gnn_embeddings_pickle",
-    "save_pytorch_model"
+    "save_pytorch_model",
+    "median_impute_per_column"
 ]
+
+def median_impute_per_column(x: torch.Tensor) -> torch.Tensor:
+    """
+    Fill NaNs in a 2D tensor (N, D) with the median of each column (ignoring NaNs).
+    Returns a new tensor; does not modify x in-place.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"Expected a 2D tensor (N, D), got shape {tuple(x.shape)}")
+
+    mask = torch.isnan(x)
+    x_tmp = x.clone()
+    x_tmp[mask] = float('inf')                  # push NaNs to the end after sorting
+    x_sorted, _ = torch.sort(x_tmp, dim=0)
+    valid_counts = (~mask).sum(dim=0)
+
+    D = x.size(1)
+    medians = x.new_empty(D)
+
+    for j in range(D):
+        k = int(valid_counts[j].item())
+        if k == 0:
+            medians[j] = float('nan')
+        elif k % 2 == 1:
+            medians[j] = x_sorted[k // 2, j]
+        else:
+            medians[j] = 0.5 * (x_sorted[k // 2 - 1, j] + x_sorted[k // 2, j])
+
+    out = x.clone()
+    out[mask] = medians.expand_as(x)[mask]
+    return out
+
 
 def save_pytorch_model(
     model,
@@ -98,7 +132,9 @@ def save_gnn_embeddings_pickle(
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     test_idx: np.ndarray,
+    x: np.ndarray | None = None,    
     y: np.ndarray | None = None,
+    label_names : list | None=None,
     extra: dict | None = None,
 ):
     """
@@ -112,8 +148,12 @@ def save_gnn_embeddings_pickle(
         Node embeddings, shape [N, d]
     train_idx, val_idx, test_idx : np.ndarray
         Index arrays into H (and y if provided)
+    x : np.ndarray | None
+        Optional multi-label targets aligned with H, shape [N, d]
     y : np.ndarray | None
         Optional multi-label targets aligned with H, shape [N, C]
+    label_names : list | None
+        Optional lsit of target names aligned with y, shape [C]
     extra : dict | None
         Any additional metadata you want to store (config, model name, etc.)
     """
@@ -125,8 +165,12 @@ def save_gnn_embeddings_pickle(
         "val_idx": val_idx.astype(np.int64, copy=False),
         "test_idx": test_idx.astype(np.int64, copy=False),
     }
+    if x is not None:
+        payload["x"] = x  # could cast to float32 if you want
     if y is not None:
         payload["y"] = y  # could cast to float32 if you want
+    if label_names is not None:
+        payload["label_names"] = label_names 
     if extra is not None:
         payload["extra"] = extra
 

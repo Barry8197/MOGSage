@@ -11,6 +11,8 @@ Functions exported
 - normalise_adjs
 - make_loader
 - split_edges_inductive
+- contrastive_distill_loss
+- per_class_metrics_from_scores
 """
 
 import os
@@ -44,8 +46,128 @@ __all__ = [
     "evaluate_multilabel",
     "normalise_adjs",
     "make_loader",
-    "split_edges_inductive"
+    "split_edges_inductive",
+    "contrastive_distill_loss",
+    "per_class_metrics_from_scores"
 ]
+
+def per_class_metrics_from_scores(y_pred: np.ndarray,
+                                 y_true: np.ndarray,
+                                 threshold: float = 0.5):
+    """
+    Compute per-class accuracy, F1 (micro), and F1 (macro) for multi-label or one-vs-rest framing.
+
+    Parameters
+    ----------
+    y_pred : (H, C) array
+        Predicted scores/probabilities (or already-binary predictions).
+    y_true : (H, C) array
+        Ground-truth labels. If `assume_one_hot_true=True`, it should be one-hot (single-label).
+        Otherwise it can be multi-hot (multi-label).
+    threshold : float
+        Threshold used to binarize y_pred if it is not already {0,1}.
+
+    Returns
+    -------
+    metrics : dict
+        {
+          "per_class": {
+             "accuracy": (C,),
+             "f1_micro": (C,),
+             "f1_macro": (C,),
+             "precision": (C,),
+             "recall": (C,),
+             "support_pos": (C,),  # number of positives in y_true per class
+          },
+          "confusion": {
+             "tp": (C,), "fp": (C,), "fn": (C,), "tn": (C,)
+          }
+        }
+
+    Notes
+    -----
+    For each class k, we treat it as a binary problem (class k vs not-k):
+      TP_k, FP_k, FN_k, TN_k
+    Per-class micro-F1 equals the binary F1 for that class:
+      F1_micro_k = 2*TP_k / (2*TP_k + FP_k + FN_k)
+    Per-class macro-F1 is the average of positive-class F1 and negative-class F1:
+      F1_macro_k = (F1_pos_k + F1_neg_k)/2
+    """
+    y_pred = np.asarray(y_pred)
+    y_true = np.asarray(y_true)
+
+    if y_pred.shape != y_true.shape or y_pred.ndim != 2:
+        raise ValueError(f"Expected y_pred and y_true to have same shape (H, C). "
+                         f"Got {y_pred.shape=} and {y_true.shape=}.")
+
+    H, C = y_true.shape
+
+    # Binarize predictions if needed
+    if np.issubdtype(y_pred.dtype, np.floating) or np.any((y_pred != 0) & (y_pred != 1)):
+        y_pred_bin = (y_pred >= threshold).astype(np.int64)
+    else:
+        y_pred_bin = y_pred.astype(np.int64)
+
+    y_true_bin = y_true.astype(np.int64)
+    if np.any((y_true_bin != 0) & (y_true_bin != 1)):
+        raise ValueError("y_true must be binary (0/1)")
+
+    # Confusion terms per class (vectorised)
+    tp = np.sum((y_pred_bin == 1) & (y_true_bin == 1), axis=0)
+    fp = np.sum((y_pred_bin == 1) & (y_true_bin == 0), axis=0)
+    fn = np.sum((y_pred_bin == 0) & (y_true_bin == 1), axis=0)
+    tn = np.sum((y_pred_bin == 0) & (y_true_bin == 0), axis=0)
+
+    # Per-class accuracy
+    acc = (tp + tn) / (tp + fp + fn + tn)
+
+    # Precision/Recall for positive class (per class)
+    precision = np.divide(tp, tp + fp, out=np.zeros_like(tp, dtype=float), where=(tp + fp) != 0)
+    recall    = np.divide(tp, tp + fn, out=np.zeros_like(tp, dtype=float), where=(tp + fn) != 0)
+
+    # Per-class F1 (micro == binary F1 for this one-vs-rest class)
+    f1_micro = np.divide(
+        2 * tp, 2 * tp + fp + fn,
+        out=np.zeros_like(tp, dtype=float),
+        where=(2 * tp + fp + fn) != 0
+    )
+
+    # Negative-class F1 (treat "not class k" as positive), then macro-average within the class.
+    precision_neg = np.divide(tn, tn + fn, out=np.zeros_like(tn, dtype=float), where=(tn + fn) != 0)
+    recall_neg    = np.divide(tn, tn + fp, out=np.zeros_like(tn, dtype=float), where=(tn + fp) != 0)
+    f1_neg = np.divide(
+        2 * precision_neg * recall_neg, precision_neg + recall_neg,
+        out=np.zeros_like(precision_neg, dtype=float),
+        where=(precision_neg + recall_neg) != 0
+    )
+
+    f1_macro = 0.5 * (f1_micro + f1_neg)
+
+    return {
+        "per_class": {
+            "accuracy": acc,
+            "f1_micro": f1_micro,
+            "f1_macro": f1_macro,
+            "precision": precision,
+            "recall": recall,
+            "support_pos": np.sum(y_true_bin == 1, axis=0),
+        },
+        "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+    }
+
+def contrastive_distill_loss(z_student, z_teacher, temperature=0.07):
+    # Conceptual InfoNCE-style contrastive distillation loss
+    # z_student, z_teacher: [B, D], L2-normalized
+    z_s = F.normalize(z_student, dim=-1)
+    z_t = F.normalize(z_teacher, dim=-1)
+    
+    # Similarities: each student embedding vs all teacher embeddings
+    logits = (z_s @ z_t.T) / temperature  # [B, B]
+    
+    # Diagonal = positive pairs (same node)
+    labels = torch.arange(len(z_s), device=z_s.device)
+    
+    return F.cross_entropy(logits, labels)
 
 def split_edges_inductive(edge_index, val_ratio=0.1, seed=42):
     torch.manual_seed(seed)
