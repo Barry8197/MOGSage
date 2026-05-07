@@ -99,15 +99,17 @@ def build_run_tag(args: argparse.Namespace) -> str:
     )
 
 
-def make_output_dirs(base: str, tag: str) -> dict:
+def make_output_dirs(base: str, tag: str, gen_emb:bool, save_model:bool) -> dict:
     """Create and return all output sub-directories for a run."""
     run_dir = os.path.join(base, tag)
     dirs = {
         "run":         run_dir,
-        "checkpoints": os.path.join(run_dir, "checkpoints"),
-        "embeddings":  os.path.join(run_dir, "embeddings"),
         "tb":          os.path.join(run_dir, "../../tb"),
     }
+    if gen_emb : 
+        dirs["embeddings"] = os.path.join(run_dir, "embeddings")
+    if save_model : 
+        dirs["checkpoints"] = os.path.join(run_dir, "checkpoints")
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
     return dirs
@@ -225,7 +227,7 @@ def train_node2vec(
             total_loss += float(loss.detach().cpu())
 
         avg_loss = total_loss / max(len(n2v_loader), 1)
-        writer.add_scalar(f"Node2Vec/avg_loss/{run_tag}", avg_loss, epoch)
+        writer.add_scalar(f"Node2Vec/avg_loss", avg_loss, epoch)
 
         if epoch % 20 == 0 or epoch == 1:
             log(f"Node2Vec  epoch {epoch:>4}/{500}  avg_loss={avg_loss:.4f}")
@@ -326,9 +328,9 @@ def train_MOGSage(
         val_loss = val_total_loss / max(val_total_seeds, 1)
 
         # ---- TensorBoard ----
-        writer.add_scalars(f"Loss/{run_tag}",       {"train": train_loss, "val": val_loss}, epoch)
-        writer.add_scalars(f"MicroF1/{run_tag}",    {"train": train_f1,   "val": val_f1},   epoch)
-        writer.add_scalar( f"ES_counter/{run_tag}", es.counter, epoch)
+        writer.add_scalars(f"Loss",       {"val": val_loss}, epoch)
+        writer.add_scalars(f"MicroF1",    {"val": val_f1},   epoch)
+        writer.add_scalar( f"ES_counter", es.counter, epoch)
 
         if epoch % 10 == 0 or epoch == 1:
             log(
@@ -409,8 +411,8 @@ def main():
     ATTRS_TO_KEEP = {'pheno_onehot'}
     device        = "cuda" if torch.cuda.is_available() else "cpu"
     run_tag       = build_run_tag(args)
-    dirs          = make_output_dirs(args.outdir, run_tag)
-    writer        = SummaryWriter(log_dir=dirs["tb"])
+    dirs          = make_output_dirs(args.outdir, run_tag, args.gen_emb, args.save_model)
+    writer        = SummaryWriter(log_dir=os.path.join(dirs["tb"],run_tag))
 
     log(f"Run tag   : {run_tag}")
     log(f"Device    : {device}")
@@ -566,14 +568,14 @@ def main():
     # Log scalar test metrics to TensorBoard
     for col in overall_df.columns:
         try:
-            writer.add_scalar(f"Test/{col}/{run_tag}", float(overall_df[col].iloc[0]), 0)
+            writer.add_scalar(f"Test/{col}", float(overall_df[col].iloc[0]), 0)
         except Exception:
             pass
     for metric in per_class_df.columns:
         for cls in per_class_df.index:
             try:
                 writer.add_scalar(
-                    f"Test_PerClass/{metric}/{cls}/{run_tag}",
+                    f"Test_PerClass/{metric}/{cls}",
                     float(per_class_df.loc[cls, metric]), 0
                 )
             except Exception:
