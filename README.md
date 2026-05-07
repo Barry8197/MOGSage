@@ -43,8 +43,8 @@ Multi-Omic Input                 Graph Structure
  [Metabolomics]   →  Multi-Modal  ←─────────────  Node2Vec
  [PGS]               Encoder          Teacher        (pre-trained)
        ↓               ↓               ↓
-    Modality        Shared         Distillation
-    Encoders        Latent         Loss (MSE)
+    Modality        Shared         Contrastive
+    Encoders        Latent            Loss
        ↓            Space
     Decoder
        ↓
@@ -54,19 +54,19 @@ Multi-Omic Input                 Graph Structure
        ↓
   Multi-Label Classification Head
        ↓
-  BCE Loss + Contrastive Distillation Loss
+  BCE Loss + Contrastive Loss
 ```
 
 ### Multi-Modal Encoder (`MOGSage`)
 
 Each omic modality is independently compressed through a two-layer encoder to a per-modality latent dimension. The latent vectors are then decoded into a shared embedding via mean pooling, creating a single unified node feature vector. This shared latent space is the input to the downstream GraphSAGE layers.
 
-### Node2Vec Teacher
+### Node2Vec 
 
-A Node2Vec model is pre-trained on the **knowledge graph (KG)** — a richer, heterogeneous graph that encodes biological priors beyond the PSN alone. The resulting structural embeddings serve as distillation targets during MOGSage training. The combined loss is:
+A Node2Vec model is pre-trained on the **knowledge graph (KG)** — a richer, heterogeneous graph that encodes biological priors beyond the PSN alone. The resulting structural embeddings serve as contrastive targets during MOGSage training. The combined loss is:
 
 ```
-L = L_BCE  +  α · L_distill(h_student, h_teacher)
+L = L_BCE  +  α · L_contrastive(h_student, h_teacher)
 ```
 
 where `α` (`--alpha_contrast`) controls the strength of structural knowledge transfer. This encourages the GNN to learn representations consistent with the underlying biology encoded in the KG, even when that graph is not directly used at inference time.
@@ -81,16 +81,24 @@ MOGSage uses `NeighborLoader` from PyTorch Geometric for scalable mini-batch tra
 
 ```
 MOGSage/
-├── mogsage.py              # Main CLI training script
-├── code/
-│   └── MAIN/
-│       ├── gnn.py          # MOGSage model + EarlyStopping
-│       ├── train.py        # Loss functions, evaluation, metrics
-│       ├── helpers.py      # Data utilities (imputation, embedding I/O)
-│       └── network_functions.py  # Graph loading, PSN construction, PyG utils
-├── gridsearch.ipynb        # Grid search command generator
-├── results_explorer.ipynb  # Interactive results analysis notebook
-└── requirements.txt
+├── mogsage.py                      # Main CLI training script
+├── environment.yml
+├── LICENSE
+├── README.md
+└── code/
+    ├── MAIN/                        # Core Python implementation (model, training, utilities)
+    │   ├── gnn.py                   # MOGSage model + EarlyStopping
+    │   ├── train.py                 # Loss functions, evaluation, metrics
+    │   ├── helpers.py               # Data utilities (imputation, embedding I/O)
+    │   ├── network_functions.py     # Graph loading, PSN construction, PyG utils
+    │   ├── preprocess_functions.py  # Omics processing functions
+    │   └── applications.py          # RaKel multi-label predicitons, embedding clustering and survival curves
+    ├── 01_meta_processing/          # Metadata format checks
+    ├── 02_omics_processing/         # Omics preprocessing + sample overlap checks
+    ├── 03_network_generation/       # Knowledge graph + PSN generation + embedding visualisation
+    ├── 04_benchmark/                # Baselines (PyTorch, scikit-learn, RAkEL)
+    ├── 05_MOGSageInteractive/       # Interactive notebooks (end-to-end experiments + grid search)
+    └── 06_applications/             # Downstream analyses (clustering, signatures, survival)
 ```
 
 ---
