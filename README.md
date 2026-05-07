@@ -4,6 +4,8 @@
 
 MOGSage is the successor to [MOGDx](https://github.com/Barry8197/MOGDx), extending the multi-omic patient similarity network framework with scalable inductive graph learning and structural knowledge distillation. Where MOGDx uses a transductive GCN, MOGSage uses GraphSAGE with mini-batch neighbour sampling, enabling training on much larger patient networks without loading the full graph into GPU memory.
 
+![Overview](https://github.com/Barry8197/MOGSage/releases/download/v1.0.0/MOGSage.png)
+
 ---
 
 ## Table of Contents
